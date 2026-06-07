@@ -216,3 +216,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Environment variables — NEVER commit this
+.env
+
+# Raw data — too large for git
+data/raw/
+
+# Virtual environment
+venv/
+env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# FAISS index files (generated, not source)
+*.index
+
+# ChromaDB
+chroma_db/
+
+# Mac system files
+.DS_Store
+**/.DS_Store
