@@ -238,4 +238,5 @@ chroma_db/
 
 # Mac system files
 .DS_Store
-**/.DS_Store
+**/.DS_Storevector_store/
+vector_store_test/
