@@ -1,112 +1,223 @@
 """
 graph.py
 
-The LangGraph agent. Starts as a trivial two-node graph 
-so we understand the mechanics, 
-then grows into a real agent with 
-routing and tools
+An Agentic RAG system built with LangGraph.
+The agent looks at each question and routes it:
+- Questions about AI/ML papers -> answered via RAG
+- Off-topic questions + politely declined
+
+This routing decision is what makes it an agent rather than a fixed pipeline
 
 """
 
-from typing import TypedDict
+from typing import TypedDict, Literal
 from langgraph.graph import StateGraph, START, END
+
+from src.retrieval.vector_store import VectorStore
+from src.embeddings.embedder import Embedder
+from src.generation.rag_chain import RAGChain
 
 class AgentState(TypedDict):
     """
     The state that flows through the graph.
 
-    Every node receives this, can read from it, and returns
-    an updated version. Think of it as the backpack the agent carries from node to node.
-
-    For now it hold two things. We will add more fields
-    (retrieved chunks, chosen tool etc) as the tool grows.
+    - route: the router's decision ('papers' and 'off-topic')
+    - sources: which documents the answer came from
     """
 
     question: str      # The user's question
-    answer: str        # The answer we build up as we go
+    route: str         # router's decision
+    answer: str        # the final answer
+    sources: list      # source documents used
 
-def greet_node(state: AgentState) -> AgentState:
+
+_embedder = Embedder()
+_store = VectorStore(_embedder)
+_store.load('vector_store')
+_rag = RAGChain(_store)
+
+def router_node(state: AgentState) -> AgentState:
     """
-    First node. Reads the question from state and starts building an answer.
+    Looks at the question and decides where to route it.
 
-    A node eceives the current state, does it's work and returns a dict with the fields it wants to update.
-    LangGraph merges that duct back into the state.
+    Uses the LLM as a classifier: is this question about AI/ML research papers, or is it off-topic?
+    Writes the decision to state['route'] as either 'papers' or 'off-topic'. The conditional edge reads this field to decide the next node
     """
 
     question = state["question"]
-    print(f" [greet_node] received question: '{question}'")
+    print(f" [router] classifying: '{question}'")
 
-    # We return only the field we want to update.
-    # LangGraph merges this into the existing state
+    # We ask LLM to classify the question
+    # The prompt is tight and forces a one-word answer
+    # so we can route it reliably
 
-    return {"answer": f"You asked: '{question}'. "} # type: ignore
+    classification_prompt = f""" You are a classifier. Decide if the following question is about AI, machine learning, deep learning, NLP, transformers or related research topics.
 
-def respond_node(state: AgentState) -> AgentState:
+Question: "{question}"
+
+Answer with ONLY one word:
+- "papers" if the question is about AI/ML/deep learning research topics
+- "offtopic" if it is about anything else
+
+Answer: """
+    
+    response = _rag.client.chat.completions.create(
+        model=_rag.LLM_MODEL,
+        messages=[{"role": "user", "content": classification_prompt}],
+        temperature=0.0,  # zero randomess, we want consistent classification
+        max_tokens=10
+    )
+
+    decision = response.choices[0].message.content.strip().lower()
+
+    # Defensive: if the LLM says anything unexpected, default to papers
+    # (better to try answering than to wrongly refuse)
+    if "offtopic" in decision:
+        route = "offtopic"
+    else:
+        route = "papers"
+
+    print(f" [router] decision: {route}")
+
+    return {"route": route}
+
+
+def rag_node(state: AgentState) -> AgentState:
     """
-    Second node. Takes the answer started by greet_node and adds to it.
-    Notice it can read 'amswer' - which the previous node wrote. That is the state
-    flowing through the graph: each node sees what previous nodes leftf behind
+    Answers the question using the RAG system from week 1
+
+    Called only when the router decided the question is about AI/ML papers.
+    Reuses the RAGChain we built - the agent doesn't reimplement RAG, it delegates to it
     """
 
-    current_answer = state["answer"]
-    print(f" [respond_node] current answer so far: '{current_answer}'")
+    question = state["question"]
+    print(f" [rag] answering from papers: '{question}'")
 
-    # Append to the answer the previous node started
-    updated = current_answer + "This is a response from the second node."
+    # Delegate to the Week 1 RAG chain
+    response = _rag.answer(question, k=5)
 
-    return {"answer": updated} # type: ignore
+    # Pull out the unique source filenames for citation
+    source_names = []
+    for chunk in response.sources:
+        name = chunk.metadata.get("source", "unknown")
+        if name not in source_names:
+            source_names.append(name)
 
+    return {
+        "answer": response.answer,
+        "sources": source_names
+    }
+
+def refuse_node(state: AgentState) -> AgentState:
+    """
+    Politely declines off-topic questions.
+
+    Called only when the router decides the question is not about AI/ML papers.
+    No LLM call, no retreival - just a fixed polite response. This saves compute on questions we can't answer anyway.
+
+    """
+    question = state["question"]
+    print(f" [refuse] declining off-topic: '{question}'")
+
+    answer = (
+        "I'm a research assistant focused on AI and machine learning "
+        "papers. That question falls outside the papers I have access to, "
+        "so I can't answer it. Try asking me about transformers, RAG, "
+        "LoRA, fine-tuning, or other AI/ML topics."
+    )
+
+    return {
+        "answer": answer,
+        "sources": []
+    }
+
+def route_decision(state: AgentState) -> AgentState:
+    """
+    The conditional edge function.
+
+    This is NOT a node - it doesn't do work or change state.
+    It reads the router's decision from state and returns the NAME of the next node to run
+
+    LangGraph calls this function after the router node, looks at what it returns, and sends the flow to that node.
+
+    Return value must match a node name we registered in the graph.
+    """
+
+    route = state["route"]
+    print(f" [route_decision] routing to: {route}")
+
+    if route == "offtopic":
+        return "refuse"
+    else:
+        return "rag"
+    
 
 def build_graph():
     """
-    Assemble the nodes into a runnable graph.
-
-    Three things happen here:
-    1) Create a graph that uses our AgentState
-    2) Add the nodes to it
-    3) Connect them with edges (define the flow) 
+    Assemble the agentic RAG graph.
+    Flow: START -> router -> (conditional) -> rag -> END
+                                   |
+                                 refuse -> END
+    The router always runs first. Then the conditional edge sends the flow to either 
+    rag or refuse based on the router's decision.
     """
-
-    # Create the graph, telling it what state shape to use
     builder = StateGraph(AgentState)
 
-    # Add our two nodes. The first argument is a name (a string label for this node), the second is the actual function.
-    builder.add_node("greet", greet_node)
-    builder.add_node("respond", respond_node)
+    # Register the three nodes
+    builder.add_node("router", router_node)
+    builder.add_node("rag", rag_node)
+    builder.add_node("refuse", refuse_node)
 
-    # Now we define the flow with edges.
-    # START is a special marker for where the graph begins
-    # END is a special marker for where it finishes
-    builder.add_edge(START, "greet")
-    builder.add_edge("greet", "respond")
-    builder.add_edge("respond", END)
+    # Start always goes to the router first
+    builder.add_edge(START, "router")
 
-    # Compile turns the builder into a runnable graph
+    # THE CONDITIONAL EDGE - this is the new mechanism
+    # After 'router' runs, call route_decision to choose
+    # the next node. The dictionary maps the function's
+    # return values to actual node names.
+    builder.add_conditional_edges(
+        "router",
+        route_decision,
+        {
+            "rag": "rag",
+            "refuse": "refuse",
+        }
+    )
+
+    # Both destination nodes lead to END
+    builder.add_edge("rag", END)
+    builder.add_edge("refuse", END)
+
     graph = builder.compile()
-
     return graph
 
-# --- Test Block ---
 if __name__ == '__main__':
-    # Build the graph
     graph = build_graph()
 
-    # Define the starting state.
-    # We provide the question. The amswer starts empty - the nodes will fill it in
-    # as the graph runs.
+    test_questions = [
+        "What is LoRA and how does it reduce trainable parameters?",
+        "How does the attention mechanism work?",
+        "What's a good recipe for pasta?",
+        "Who won the football match last night?",
+    ]
 
-    initial_state = {
-        "question": "How does attention work?",
-        "answer": ""
-    }
+    for question in test_questions:
+        print("\n" + "=" * 60)
+        print(f"QUESTION:{question}")
+        print("=" * 60)
 
-    print("="*50)
-    print("RUNNING THE SCRIPT")
-    print("="*50)
-    print(f"\nInitial State: {initial_state}\n")
+        # Run the agent, answer the sources start empty;
+        # the nodes fill them in depending on the path taken.
+        initial_state = {
+            "question": question,
+            "route": "",
+            "answer": "",
+            "sources": []
+        }
 
-    # invoke() runs the graph from START to END, passing the state through each node in order.
-    final_state = graph.invoke(initial_state)
+        final_state = graph.invoke(initial_state)
 
-    print(f"Final state: {final_state}")
-    print(f"\nFinal answer: {final_state['answer']}")
+        print(f"\n ROUTE TAKEN: {final_state['route']}")
+        print(f" ANSWER: {final_state['answer'][:250]}")
+        if final_state['sources']:
+            print(f" SOURCES: {final_state['sources']}")
