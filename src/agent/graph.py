@@ -17,6 +17,8 @@ from src.retrieval.vector_store import VectorStore
 from src.embeddings.embedder import Embedder
 from src.generation.rag_chain import RAGChain
 
+from src.agent.web_search import WebSearchTool
+
 class AgentState(TypedDict):
     """
     The state that flows through the graph.
@@ -35,6 +37,7 @@ _embedder = Embedder()
 _store = VectorStore(_embedder)
 _store.load('vector_store')
 _rag = RAGChain(_store)
+_web = WebSearchTool()
 
 def router_node(state: AgentState) -> AgentState:
     """
@@ -57,6 +60,7 @@ Question: "{question}"
 
 Answer with ONLY one word:
 - "papers" if the question is about AI/ML/deep learning research topics
+- "web" — questions about CURRENT or RECENT AI/ML information: latest model releases, recent news, current versions, what's newest (e.g. "what's the newest Llama model", "latest GPT version")
 - "offtopic" if it is about anything else
 
 Answer: """
@@ -74,6 +78,9 @@ Answer: """
     # (better to try answering than to wrongly refuse)
     if "offtopic" in decision:
         route = "offtopic"
+        
+    elif "web" in decision:
+        route = "web"
     else:
         route = "papers"
 
@@ -106,6 +113,47 @@ def rag_node(state: AgentState) -> AgentState:
     return {
         "answer": response.answer,
         "sources": source_names
+    }
+
+def web_node(state: AgentState) -> AgentState:
+    """
+    Answers the question using live web search.
+
+    Called when the router decided the question needs current information
+    not in the static papers.
+
+    Pattern mirrors rag_node: get context (from the web instead of papers), then have the LLM answer from it.
+    """
+
+    question = state["question"]
+    print(f" [web] searching the web for: '{question}'")
+
+    # Step 1: get web results as formatted context
+    web_context = _web.search(question, max_results=5)
+
+    # Step 2: have the LLM answer using the web context
+    # Only answering from the provided context, cite sources.
+    prompt = f"""Answer the question using only the web search results below. Cite sources where relevant. If the results don't contain enough information, say so.
+
+Web search results:
+{web_context}
+
+Question: {question}
+
+Answer:"""
+    
+    response = _rag.client.chat.completions.create(
+        model=_rag.LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=1024
+    )
+
+    answer = response.choices[0].message.content
+
+    return {
+        "answer": answer,
+        "sources": ["web search"]
     }
 
 def refuse_node(state: AgentState) -> AgentState:
@@ -148,6 +196,8 @@ def route_decision(state: AgentState) -> AgentState:
 
     if route == "offtopic":
         return "refuse"
+    elif route == "web":
+        return "web"
     else:
         return "rag"
     
@@ -166,6 +216,7 @@ def build_graph():
     # Register the three nodes
     builder.add_node("router", router_node)
     builder.add_node("rag", rag_node)
+    builder.add_node("web", web_node)
     builder.add_node("refuse", refuse_node)
 
     # Start always goes to the router first
@@ -180,12 +231,14 @@ def build_graph():
         route_decision,
         {
             "rag": "rag",
+            "web": "web",
             "refuse": "refuse",
         }
     )
 
     # Both destination nodes lead to END
     builder.add_edge("rag", END)
+    builder.add_edge("web", END)
     builder.add_edge("refuse", END)
 
     graph = builder.compile()
@@ -195,10 +248,11 @@ if __name__ == '__main__':
     graph = build_graph()
 
     test_questions = [
-        "What is LoRA and how does it reduce trainable parameters?",
-        "How does the attention mechanism work?",
-        "What's a good recipe for pasta?",
-        "Who won the football match last night?",
+        "What is LoRA and how does it reduce trainable parameters?",  # papers → rag
+        "How does the attention mechanism work?",                      # papers → rag
+        "What is the newest Llama model released in 2026?",            # web → web search
+        "What are the latest developments in AI agents this year?",    # web → web search
+        "What's a good recipe for pasta?",                             # offtopic → refuse
     ]
 
     for question in test_questions:
