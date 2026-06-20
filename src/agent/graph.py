@@ -21,14 +21,20 @@ from src.agent.web_search import WebSearchTool
 
 class AgentState(TypedDict):
     """
-    The state that flows through the graph.
+    State for the multi-tool agent
 
-    - route: the router's decision ('papers' and 'off-topic')
-    - sources: which documents the answer came from
+    New fields for Day 9;
+     - needs_papers: did the planner decide we need the paper corpus?
+     - needs_web: did the planner decide we need web search?
+     - paper_context: text gathered from RAG retreival
+     - web_context: textr gathered from web search
     """
 
     question: str      # The user's question
-    route: str         # router's decision
+    needs_papers: bool # planner decision: use papers?
+    needs_web: bool    # planner decision: needs web?
+    paper_context: str # context gathered from the papers
+    web_context: str   # context gathered from web
     answer: str        # the final answer
     sources: list      # source documents used
 
@@ -39,109 +45,174 @@ _store.load('vector_store')
 _rag = RAGChain(_store)
 _web = WebSearchTool()
 
-def router_node(state: AgentState) -> AgentState:
+def planner_node(state: AgentState) -> AgentState:
     """
-    Looks at the question and decides where to route it.
+    Decides which tools the question needs — possibly more than one.
 
-    Uses the LLM as a classifier: is this question about AI/ML research papers, or is it off-topic?
-    Writes the decision to state['route'] as either 'papers' or 'off-topic'. The conditional edge reads this field to decide the next node
+    Unlike the Day 8 router (which picked ONE path), the planner
+    makes two independent yes/no decisions: papers? web? This lets
+    it handle questions that need both sources.
+
+    Writes needs_papers and needs_web to the state.
     """
-
     question = state["question"]
-    print(f" [router] classifying: '{question}'")
+    print(f"  [planner] planning tools for: '{question}'")
 
-    # We ask LLM to classify the question
-    # The prompt is tight and forces a one-word answer
-    # so we can route it reliably
-
-    classification_prompt = f""" You are a classifier. Decide if the following question is about AI, machine learning, deep learning, NLP, transformers or related research topics.
+    planning_prompt = f"""You are a planning assistant. Decide which information sources are needed to answer the question.
 
 Question: "{question}"
 
-Answer with ONLY one word:
-- "papers" if the question is about AI/ML/deep learning research topics
-- "web" — questions about CURRENT or RECENT AI/ML information: latest model releases, recent news, current versions, what's newest (e.g. "what's the newest Llama model", "latest GPT version")
-- "offtopic" if it is about anything else
+Two sources are available:
+1. PAPERS — a corpus of foundational AI/ML research papers (transformers, BERT, RAG, LoRA, RLHF, diffusion, etc.). Use for conceptual or theoretical questions about established AI/ML methods.
+2. WEB — live web search. Use for current/recent information: latest model releases, recent news, current versions, anything time-sensitive.
 
-Answer: """
-    
+A question may need ONE source, BOTH, or NEITHER (if it's completely off-topic, not about AI/ML at all).
+
+Respond in exactly this format, with yes or no for each:
+PAPERS: yes/no
+WEB: yes/no
+
+Examples:
+- "What is LoRA?" → PAPERS: yes, WEB: no
+- "What's the newest Llama model?" → PAPERS: no, WEB: yes
+- "How does the newest Llama compare to the original transformer?" → PAPERS: yes, WEB: yes
+- "What's a good pasta recipe?" → PAPERS: no, WEB: no
+
+Now answer for the question above:"""
+
     response = _rag.client.chat.completions.create(
         model=_rag.LLM_MODEL,
-        messages=[{"role": "user", "content": classification_prompt}],
-        temperature=0.0,  # zero randomess, we want consistent classification
-        max_tokens=10
+        messages=[{"role": "user", "content": planning_prompt}],
+        temperature=0.0,
+        max_tokens=30
     )
 
-    decision = response.choices[0].message.content.strip().lower()
+    decision_text = response.choices[0].message.content.lower()
 
-    # Defensive: if the LLM says anything unexpected, default to papers
-    # (better to try answering than to wrongly refuse)
-    if "offtopic" in decision:
-        route = "offtopic"
-        
-    elif "web" in decision:
-        route = "web"
-    else:
-        route = "papers"
+    # Parse the two decisions from the response
+    needs_papers = "papers: yes" in decision_text
+    needs_web = "web: yes" in decision_text
 
-    print(f" [router] decision: {route}")
-
-    return {"route": route}
-
-
-def rag_node(state: AgentState) -> AgentState:
-    """
-    Answers the question using the RAG system from week 1
-
-    Called only when the router decided the question is about AI/ML papers.
-    Reuses the RAGChain we built - the agent doesn't reimplement RAG, it delegates to it
-    """
-
-    question = state["question"]
-    print(f" [rag] answering from papers: '{question}'")
-
-    # Delegate to the Week 1 RAG chain
-    response = _rag.answer(question, k=5)
-
-    # Pull out the unique source filenames for citation
-    source_names = []
-    for chunk in response.sources:
-        name = chunk.metadata.get("source", "unknown")
-        if name not in source_names:
-            source_names.append(name)
+    print(f"  [planner] needs_papers={needs_papers}, needs_web={needs_web}")
 
     return {
-        "answer": response.answer,
-        "sources": source_names
+        "needs_papers": needs_papers,
+        "needs_web": needs_web
     }
-
-def web_node(state: AgentState) -> AgentState:
+def gather_papers_node(state: AgentState) -> AgentState:
     """
-    Answers the question using live web search.
+    Gathers context from the paper corpus IF the planner
+    decided papers are needed.
 
-    Called when the router decided the question needs current information
-    not in the static papers.
-
-    Pattern mirrors rag_node: get context (from the web instead of papers), then have the LLM answer from it.
+    Note: this node does NOT generate an answer. It only
+    retrieves context and stores it. Generation happens
+    later, once all context from all sources is gathered.
     """
+    if not state.get("needs_papers"):
+        # Planner said papers aren't needed — skip, store nothing
+        print(f"  [gather_papers] skipped (not needed)")
+        return {"paper_context": ""}
 
     question = state["question"]
-    print(f" [web] searching the web for: '{question}'")
+    print(f"  [gather_papers] retrieving from papers")
 
-    # Step 1: get web results as formatted context
+    # Use the vector store directly to get chunks (no generation)
+    results = _store.search(question, k=5)
+
+    # Format chunks into context text
+    context_parts = []
+    sources = []
+    for chunk, score in results:
+        source = chunk.metadata.get("source", "unknown")
+        context_parts.append(f"[From {source}]\n{chunk.content}")
+        if source not in sources:
+            sources.append(source)
+
+    paper_context = "\n\n".join(context_parts)
+
+    return {
+        "paper_context": paper_context,
+        "sources": sources
+    }
+
+
+def gather_web_node(state: AgentState) -> AgentState:
+    """
+    Gathers context from web search IF the planner decided
+    web is needed.
+
+    Like gather_papers_node, this only collects context —
+    no answer generation here.
+    """
+    if not state.get("needs_web"):
+        print(f"  [gather_web] skipped (not needed)")
+        return {"web_context": ""}
+
+    question = state["question"]
+    print(f"  [gather_web] searching the web")
+
     web_context = _web.search(question, max_results=5)
 
-    # Step 2: have the LLM answer using the web context
-    # Only answering from the provided context, cite sources.
-    prompt = f"""Answer the question using only the web search results below. Cite sources where relevant. If the results don't contain enough information, say so.
+    # Append "web search" to existing sources
+    existing_sources = state.get("sources", [])
+    updated_sources = existing_sources + ["web search"]
 
-Web search results:
-{web_context}
+    return {
+        "web_context": web_context,
+        "sources": updated_sources
+    }
+
+def generate_node(state: AgentState) -> AgentState:
+    """
+    Generates the final answer from all gathered context.
+
+    This is the synthesis step. It combines paper_context and
+    web_context (whichever were gathered) into one prompt and
+    produces a single unified answer.
+
+    If neither source was gathered, the question was off-topic,
+    so we refuse.
+    """
+    question = state["question"]
+    paper_context = state.get("paper_context", "")
+    web_context = state.get("web_context", "")
+
+    # Case: neither source gathered → off-topic → refuse
+    if not paper_context and not web_context:
+        print(f"  [generate] no context — refusing")
+        return {
+            "answer": (
+                "I'm a research assistant focused on AI and machine "
+                "learning. That question falls outside what I can help "
+                "with. Try asking about AI/ML concepts or recent "
+                "developments in the field."
+            ),
+            "sources": []
+        }
+
+    print(f"  [generate] synthesizing answer from gathered context")
+
+    # Build a combined context section, labeling each source type
+    context_sections = []
+    if paper_context:
+        context_sections.append(
+            f"=== From research papers ===\n{paper_context}"
+        )
+    if web_context:
+        context_sections.append(
+            f"=== From web search ===\n{web_context}"
+        )
+    combined_context = "\n\n".join(context_sections)
+
+    # Build the generation prompt
+    prompt = f"""You are a research assistant. Answer the question using only the context below, which may come from research papers, web search, or both. Synthesize a single coherent answer. If the context combines historical and current information, connect them clearly. Cite which source type information came from when relevant. If the context doesn't fully answer the question, say so.
+
+{combined_context}
 
 Question: {question}
 
 Answer:"""
-    
+
     response = _rag.client.chat.completions.create(
         model=_rag.LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -151,127 +222,69 @@ Answer:"""
 
     answer = response.choices[0].message.content
 
-    return {
-        "answer": answer,
-        "sources": ["web search"]
-    }
+    return {"answer": answer}
 
-def refuse_node(state: AgentState) -> AgentState:
-    """
-    Politely declines off-topic questions.
-
-    Called only when the router decides the question is not about AI/ML papers.
-    No LLM call, no retreival - just a fixed polite response. This saves compute on questions we can't answer anyway.
-
-    """
-    question = state["question"]
-    print(f" [refuse] declining off-topic: '{question}'")
-
-    answer = (
-        "I'm a research assistant focused on AI and machine learning "
-        "papers. That question falls outside the papers I have access to, "
-        "so I can't answer it. Try asking me about transformers, RAG, "
-        "LoRA, fine-tuning, or other AI/ML topics."
-    )
-
-    return {
-        "answer": answer,
-        "sources": []
-    }
-
-def route_decision(state: AgentState) -> AgentState:
-    """
-    The conditional edge function.
-
-    This is NOT a node - it doesn't do work or change state.
-    It reads the router's decision from state and returns the NAME of the next node to run
-
-    LangGraph calls this function after the router node, looks at what it returns, and sends the flow to that node.
-
-    Return value must match a node name we registered in the graph.
-    """
-
-    route = state["route"]
-    print(f" [route_decision] routing to: {route}")
-
-    if route == "offtopic":
-        return "refuse"
-    elif route == "web":
-        return "web"
-    else:
-        return "rag"
     
-
 def build_graph():
     """
-    Assemble the agentic RAG graph.
-    Flow: START -> router -> (conditional) -> rag -> END
-                                   |
-                                 refuse -> END
-    The router always runs first. Then the conditional edge sends the flow to either 
-    rag or refuse based on the router's decision.
+    Assemble the multi-tool agent graph.
+
+    Flow (linear, but gather nodes are conditionally active):
+        START → planner → gather_papers → gather_web → generate → END
+
+    Unlike Day 8's branching graph, here the nodes run in sequence.
+    The planner sets the booleans, and each gather node checks those
+    booleans to decide whether to do work or skip. Generation then
+    synthesizes whatever was gathered.
     """
     builder = StateGraph(AgentState)
 
-    # Register the three nodes
-    builder.add_node("router", router_node)
-    builder.add_node("rag", rag_node)
-    builder.add_node("web", web_node)
-    builder.add_node("refuse", refuse_node)
+    # Register all four nodes
+    builder.add_node("planner", planner_node)
+    builder.add_node("gather_papers", gather_papers_node)
+    builder.add_node("gather_web", gather_web_node)
+    builder.add_node("generate", generate_node)
 
-    # Start always goes to the router first
-    builder.add_edge(START, "router")
-
-    # THE CONDITIONAL EDGE - this is the new mechanism
-    # After 'router' runs, call route_decision to choose
-    # the next node. The dictionary maps the function's
-    # return values to actual node names.
-    builder.add_conditional_edges(
-        "router",
-        route_decision,
-        {
-            "rag": "rag",
-            "web": "web",
-            "refuse": "refuse",
-        }
-    )
-
-    # Both destination nodes lead to END
-    builder.add_edge("rag", END)
-    builder.add_edge("web", END)
-    builder.add_edge("refuse", END)
+    # Wire them in sequence
+    builder.add_edge(START, "planner")
+    builder.add_edge("planner", "gather_papers")
+    builder.add_edge("gather_papers", "gather_web")
+    builder.add_edge("gather_web", "generate")
+    builder.add_edge("generate", END)
 
     graph = builder.compile()
     return graph
 
+
+# --- Test block ---
 if __name__ == '__main__':
     graph = build_graph()
 
     test_questions = [
-        "What is LoRA and how does it reduce trainable parameters?",  # papers → rag
-        "How does the attention mechanism work?",                      # papers → rag
-        "What is the newest Llama model released in 2026?",            # web → web search
-        "What are the latest developments in AI agents this year?",    # web → web search
-        "What's a good recipe for pasta?",                             # offtopic → refuse
+        "What is LoRA and how does it reduce trainable parameters?",      # papers only
+        "What is the newest Llama model released in 2026?",               # web only
+        "How does the newest Llama model compare to the original transformer architecture?",  # BOTH
+        "What's a good recipe for pasta?",                                # neither → refuse
     ]
 
     for question in test_questions:
-        print("\n" + "=" * 60)
-        print(f"QUESTION:{question}")
-        print("=" * 60)
+        print("\n" + "=" * 65)
+        print(f"QUESTION: {question}")
+        print("=" * 65)
 
-        # Run the agent, answer the sources start empty;
-        # the nodes fill them in depending on the path taken.
         initial_state = {
             "question": question,
-            "route": "",
+            "needs_papers": False,
+            "needs_web": False,
+            "paper_context": "",
+            "web_context": "",
             "answer": "",
             "sources": []
         }
 
         final_state = graph.invoke(initial_state)
 
-        print(f"\n ROUTE TAKEN: {final_state['route']}")
-        print(f" ANSWER: {final_state['answer'][:250]}")
+        print(f"\n  PLAN: papers={final_state['needs_papers']}, web={final_state['needs_web']}")
+        print(f"  ANSWER: {final_state['answer'][:350]}")
         if final_state['sources']:
-            print(f" SOURCES: {final_state['sources']}")
+            print(f"  SOURCES: {final_state['sources']}")
