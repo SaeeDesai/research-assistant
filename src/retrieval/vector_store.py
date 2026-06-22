@@ -19,6 +19,7 @@ import pickle
 from pathlib import Path
 from src.chunking.chunker import Chunk
 from src.embeddings.embedder import Embedder
+from src.retrieval.reranker import Reranker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,6 +153,43 @@ class VectorStore:
             results.append((chunk, similarity))
 
         return results
+    
+    def search_with_rerank(
+        self,
+        query: str,
+        k: int = 5,
+        fetch_k: int = 15,
+        reranker: Reranker = None
+    ) -> list[tuple[Chunk, float]]:
+        """
+        Two-stage retrieval: bi-encoder retrieves broad, then
+        cross-encoder reranks to the precise top-k.
+
+        Stage 1: fast FAISS search returns fetch_k candidates
+                 (more than we need — recall catches the right chunk).
+        Stage 2: the cross-encoder reranks those candidates and
+                 returns the true top-k by joint relevance scoring.
+
+        Args:
+            query:    the user's question
+            k:        final number of chunks to return
+            fetch_k:  how many candidates to retrieve before reranking
+            reranker: a Reranker instance (passed in so we load it once)
+
+        Returns:
+            List of (Chunk, rerank_score) tuples, length k
+        """
+        if reranker is None:
+            raise ValueError("search_with_rerank requires a Reranker instance")
+
+        # Stage 1: retrieve fetch_k candidates with fast bi-encoder search
+        candidates = self.search(query, k=fetch_k)
+        candidate_chunks = [chunk for chunk, score in candidates]
+
+        # Stage 2: rerank down to the precise top-k
+        reranked = reranker.rerank(query, candidate_chunks, top_k=k)
+
+        return reranked
 
     def save(self, save_dir: str = 'vector_store') -> None:
         """
