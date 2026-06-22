@@ -157,39 +157,79 @@ class VectorStore:
     def search_with_rerank(
         self,
         query: str,
-        k: int = 5,
-        fetch_k: int = 15,
-        reranker: Reranker = None
+        reranker: Reranker,
+        initial_k: int = 15,
+        final_k: int = 5
     ) -> list[tuple[Chunk, float]]:
         """
-        Two-stage retrieval: bi-encoder retrieves broad, then
-        cross-encoder reranks to the precise top-k.
+        Two-stage retrieval: retrieve broad with the bi-encoder,
+        then rerank narrow with the cross-encoder.
 
-        Stage 1: fast FAISS search returns fetch_k candidates
-                 (more than we need — recall catches the right chunk).
-        Stage 2: the cross-encoder reranks those candidates and
-                 returns the true top-k by joint relevance scoring.
+        Stage 1 (recall): fast FAISS search returns initial_k
+        candidates — wide enough that the right chunk is almost
+        always in here (our recall@5 was already 100%).
+
+        Stage 2 (precision): the cross-encoder re-scores those
+        candidates by reading each (query, chunk) pair together,
+        and returns the final_k most relevant.
 
         Args:
-            query:    the user's question
-            k:        final number of chunks to return
-            fetch_k:  how many candidates to retrieve before reranking
-            reranker: a Reranker instance (passed in so we load it once)
+            query:     the user's question
+            reranker:  a loaded Reranker instance
+            initial_k: how many candidates to retrieve first
+            final_k:   how many to return after reranking
 
         Returns:
-            List of (Chunk, rerank_score) tuples, length k
+            List of (Chunk, rerank_score), length final_k
         """
-        if reranker is None:
-            raise ValueError("search_with_rerank requires a Reranker instance")
+        # Stage 1: broad retrieval with bi-encoder
+        initial_results = self.search(query, k=initial_k)
+        candidate_chunks = [chunk for chunk, score in initial_results]
 
-        # Stage 1: retrieve fetch_k candidates with fast bi-encoder search
-        candidates = self.search(query, k=fetch_k)
-        candidate_chunks = [chunk for chunk, score in candidates]
-
-        # Stage 2: rerank down to the precise top-k
-        reranked = reranker.rerank(query, candidate_chunks, top_k=k)
+        # Stage 2: narrow reranking with cross-encoder
+        reranked = reranker.rerank(query, candidate_chunks, top_k=final_k)
 
         return reranked
+    
+    def search_filtered(
+        self,
+        query: str,
+        k: int = 5,
+        source_filter: str = None
+    ) -> list[tuple[Chunk, float]]:
+        """
+        Search, optionally restricting results to a single source.
+
+        When we know which paper a question is about, filtering to
+        that source prevents conceptually-similar chunks from other
+        papers (semantic overlap) from outranking the right answer.
+
+        Strategy: retrieve a wide candidate set, then keep only
+        chunks from the target source, returning the top k of those.
+
+        Args:
+            query:         the user's question
+            k:             how many results to return
+            source_filter: filename to restrict to (e.g. 'lora.pdf'),
+                           or None for normal unfiltered search
+
+        Returns:
+            List of (Chunk, score), filtered if source_filter given
+        """
+        if source_filter is None:
+            return self.search(query, k=k)
+
+        # Retrieve a wide set so enough of the target source survives
+        wide = self.search(query, k=50)
+
+        # Keep only chunks from the target source
+        filtered = [
+            (chunk, score)
+            for chunk, score in wide
+            if chunk.metadata.get("source") == source_filter
+        ]
+
+        return filtered[:k]
 
     def save(self, save_dir: str = 'vector_store') -> None:
         """
