@@ -116,6 +116,32 @@ python -m src.agent.graph
 | "How does the newest Llama compare to the original transformer?" | Searches **both** papers and web → synthesizes one answer |
 | "What's a good recipe for pasta?" | Recognizes it's off-topic → politely declines |
 
+## Evaluation
+
+The system includes a custom evaluation harness that measures retrieval and answer quality against a ground-truth test set, using both objective metrics and an LLM-as-judge.
+
+**Metrics measured:**
+- **Top-1 precision** — is the correct source document ranked first?
+- **Recall@5** — is the correct source retrieved at all (in the top 5)?
+- **Faithfulness** (LLM-judged, 1–5) — is the answer grounded in the retrieved context, or hallucinated?
+- **Relevance** (LLM-judged, 1–5) — does the answer actually address the question?
+
+**Baseline results:**
+
+| Metric | Score |
+|--------|-------|
+| Top-1 precision | 80% |
+| Recall@5 | 100% |
+| Faithfulness | 5.00 / 5 (zero hallucination) |
+| Relevance | 4.00 / 5 |
+
+**Why decomposed metrics matter:** Using three separate metrics instead of one combined score localizes *where* failures occur. For example, one specific-detail question scored perfect faithfulness (5/5) but low relevance (1/5) — revealing that the right document was retrieved but the specific answer-bearing chunk was not, so the system honestly refused rather than fabricating. A single quality score would have hidden this.
+
+**Improving precision — measured experiments:** The 100% recall but 80% top-1 precision indicated a *ranking* problem (the right document is retrieved but sometimes ranked below a topically-similar lookalike). Two fixes were tested:
+
+- **Cross-encoder reranking** — measured a *regression* (80% → 60%). A general-purpose reranker (trained on web-search data) underperformed on this homogeneous corpus where every candidate is a dense, topically-similar AI paper. Documented as a negative result.
+- **Metadata source filtering** — restricting retrieval to the relevant paper when known eliminated lookalike interference and recovered correct top-1 retrieval on known failure cases.
+
 ## Project structure
 
 ```
@@ -126,7 +152,8 @@ research-assistant/
 │   ├── embeddings/       # sentence-transformer embeddings
 │   ├── retrieval/        # FAISS vector store
 │   ├── generation/       # RAG chain (retrieve + generate)
-│   └── agent/            # LangGraph agent: planner, tools, graph
+|   ├── agent/            # LangGraph agent: planner, tools, graph
+│   └── evaluation/       # test set, harness, scorers, report card  
 ├── docs/                 # technical report + dev log
 ├── download_papers.py    # fetch papers from arXiv
 ├── upload_to_s3.py       # upload papers to S3
@@ -144,4 +171,4 @@ A few choices worth highlighting (the full reasoning is in [docs/TECHNICAL_REPOR
 
 ## What I learned
 
-This project was built to deeply understand modern AI engineering end-to-end: how raw documents become a searchable knowledge base, how semantic search actually works, how RAG grounds LLM answers, and how agentic systems plan and use tools. Every component was built from first principles rather than abstracted away, with a focus on understanding *why* each design choice was made.
+This project was built to deeply understand modern AI engineering end-to-end: how raw documents become a searchable knowledge base, how semantic search actually works, how RAG grounds LLM answers, and how agentic systems plan and use tools. Every component was built from first principles rather than abstracted away, with a focus on understanding *why* each design choice was made — including building a custom evaluation harness to measure quality rather than assume it, and testing improvements empirically (some of which regressed and were rejected with evidence).
